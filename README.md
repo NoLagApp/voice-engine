@@ -9,6 +9,14 @@ interfaces. What it owns is the part that is genuinely hard, and that no prompt
 can fix: deciding when someone has stopped talking, who holds the channel, and
 what the caller actually hears.
 
+It is one half of a voice agent. This half has to answer in about a second, so
+it stays fast and knows nothing. Add
+[`@nolag/voice`](https://www.npmjs.com/package/@nolag/voice) and the call gains
+the other half: a room through which it reaches a larger orchestrator for
+knowledge and tool calls, and a human who can watch or approve. See
+[Reflexes, not knowledge](#reflexes-not-knowledge) for why that split is the
+whole point rather than an inconvenience.
+
 ```bash
 npm install @nolag/voice-engine
 ```
@@ -127,13 +135,39 @@ interface TextToSpeech  { readonly sampleRate: number; speak(req): Promise<void>
 byte is what governs how responsive the agent feels, and the gap between
 providers is measured in seconds rather than milliseconds.
 
+## Reflexes, not knowledge
+
+This engine gives a call reflexes. It knows when you stopped speaking, who holds
+the channel, when to interrupt itself and when to stay quiet. It knows nothing
+about your business, and it cannot do anything.
+
+That is a design decision rather than a missing feature, and it follows from the
+clock. The model inside the conversation loop has to answer in about a second,
+which means it has to be small, which makes it exactly the wrong thing to decide
+whether a booking can be moved or what a customer is owed. It also has no tools,
+so left alone it will cheerfully say "I have updated that for you" while nothing
+anywhere has changed.
+
+Real work runs on a different clock. Looking something up, changing a record,
+waiting for a human to approve it: five to thirty seconds, sometimes longer. You
+cannot nest that inside a one second budget, so it belongs to a separate
+participant the call talks to, not to the model answering the phone.
+
+Notice that the filler speech here is already the mechanism for covering that
+wait. It exists because synthesis was slow, and it is exactly what lets an agent
+say "let me check that for you" while something more capable does the work.
+
 ## Coordination
 
-The engine is deliberately alone in the world. Pair it with
-[`@nolag/voice`](https://www.npmjs.com/package/@nolag/voice) to make each call a
-NoLag room, so dashboards, supervisors and other agents can watch a call and
-steer it while it is happening. `VoiceSession` takes an `observer`, and the
-blueprint's publisher is shaped to be one.
+Pair it with [`@nolag/voice`](https://www.npmjs.com/package/@nolag/voice) and
+each call becomes a NoLag room. That room is how the call reaches the rest of
+your system: a larger orchestrator with the knowledge and the tools, a human
+supervisor who can steer or approve, and any dashboard that wants to watch.
+`VoiceSession` takes an `observer`, and that package's publisher is shaped to be
+one, so the two clip together without either knowing much about the other.
+
+Together they are a complete voice agent: fast reflexes on the phone, real
+capability behind it.
 
 ## Recording and consent
 
