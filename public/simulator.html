@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice Agent Call Simulator</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: #0d1117; color: #e6edf3;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .card {
+    width: min(560px, 92vw); background: #161b22; border: 1px solid #30363d;
+    border-radius: 12px; padding: 28px;
+  }
+  h1 { margin: 0 0 4px; font-size: 20px; }
+  .sub { margin: 0 0 20px; color: #8b949e; font-size: 13px; }
+  .row { display: flex; align-items: center; gap: 14px; margin-bottom: 16px; }
+  button {
+    font-size: 15px; font-weight: 600; padding: 10px 22px; border-radius: 8px;
+    border: none; cursor: pointer; background: #238636; color: #fff;
+  }
+  button.live { background: #da3633; }
+  button:disabled { opacity: .5; cursor: default; }
+  .state { font-size: 14px; color: #8b949e; }
+  .state b { color: #e6edf3; font-weight: 600; }
+  .callsid {
+    font-family: ui-monospace, monospace; font-size: 12px; color: #79c0ff;
+    user-select: all; word-break: break-all;
+  }
+  .meterwrap { margin: 6px 0 16px; }
+  .meterlabel { font-size: 12px; color: #8b949e; display: flex; justify-content: space-between; }
+  .meter { height: 8px; background: #21262d; border-radius: 4px; overflow: hidden; position: relative; }
+  .meter .fill { height: 100%; width: 0; background: #3fb950; transition: width 60ms linear; }
+  .meter .threshold { position: absolute; top: -2px; bottom: -2px; width: 2px; background: #d29922; }
+  #log {
+    background: #0d1117; border: 1px solid #30363d; border-radius: 8px;
+    height: 220px; overflow-y: auto; padding: 10px 12px; margin: 0;
+    font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.6;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .hint { margin-top: 12px; font-size: 12px; color: #8b949e; line-height: 1.5; }
+  .hint code { color: #79c0ff; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Voice Agent Call Simulator</h1>
+  <p class="sub">Speaks the Twilio Media Streams protocol at <code id="wsurl"></code>, so the server sees a real call. Use headphones to avoid the agent hearing itself.</p>
+
+  <div class="row">
+    <button id="callBtn">Start call</button>
+    <div class="state">Status: <b id="status">idle</b><br><span class="callsid" id="callsid"></span></div>
+  </div>
+
+  <div class="meterwrap">
+    <div class="meterlabel"><span>Mic level (RMS)</span><span id="rmsval">0</span></div>
+    <div class="meter"><div class="fill" id="meter"></div><div class="threshold" id="thresh"></div></div>
+    <div class="meterlabel"><span></span><span>marker = speech threshold floor (500)</span></div>
+  </div>
+
+  <pre id="log"></pre>
+
+  <p class="hint">
+    Call ID for this session, for correlating logs, recordings or a live monitor:<br>
+    <code id="monitorcmd">not started</code><br>
+    If the agent misses quiet speech or triggers on noise, tune the detector's
+    <code>speechRms</code> and <code>noiseMultiplier</code> against the meter above.
+  </p>
+</div>
+
+<script>
+// ---------------------------------------------------------------------------
+// Twilio Media Streams simulator.
+//
+// Outbound to server:  connected, start, media (mu-law 8k, 20 ms frames),
+//                      mark echoes after playback, stop on hangup.
+// Inbound from server: media (agent speech), mark, clear (barge-in flush).
+// ---------------------------------------------------------------------------
+
+const FRAME_8K = 160;              // 20 ms at 8 kHz
+const SPEECH_RMS_DEFAULT = 500;    // mirror of the server default, meter marker only
+const METER_MAX = 4000;            // meter full scale
+
+const $ = (id) => document.getElementById(id);
+const wsUrl = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/media";
+$("wsurl").textContent = wsUrl;
+$("thresh").style.left = (SPEECH_RMS_DEFAULT / METER_MAX * 100) + "%";
+
+let ws = null, ctx = null, micStream = null, workletNode = null;
+let running = false;
+let streamSid = "", callSid = "";
+let pending = new Float32Array(0); // mic samples awaiting framing, at ctx rate
+let playhead = 0;                  // WebAudio time where queued agent audio ends
+let sources = [];                  // scheduled agent audio, for clear()
+let pendingMarks = [];             // marks awaiting playback completion
+
+function log(line) {
+  const el = $("log");
+  el.textContent += line + "\n";
+  el.scrollTop = el.scrollHeight;
+}
+function setStatus(s) { $("status").textContent = s; }
+
+// --- G.711 mu-law, same algorithm as the server ---------------------------
+const MULAW_BIAS = 0x84, MULAW_MAX = 32635;
+function mulawEncodeSample(sample) {
+  const sign = sample < 0 ? 0x80 : 0;
+  if (sample < 0) sample = -sample;
+  if (sample > MULAW_MAX) sample = MULAW_MAX;
+  sample += MULAW_BIAS;
+  let exponent = 7;
+  for (let mask = 0x4000; (sample & mask) === 0 && exponent > 0; exponent--, mask >>= 1);
+  return ~(sign | (exponent << 4) | ((sample >> (exponent + 3)) & 0x0f)) & 0xff;
+}
+function mulawDecodeSample(u) {
+  u = ~u & 0xff;
+  const sign = u & 0x80, exponent = (u >> 4) & 0x07, mantissa = u & 0x0f;
+  const sample = (((mantissa << 3) + MULAW_BIAS) << exponent) - MULAW_BIAS;
+  return sign ? -sample : sample;
+}
+
+// --- Mic capture -> 20 ms mu-law frames -----------------------------------
+function onMicChunk(chunk) {
+  const joined = new Float32Array(pending.length + chunk.length);
+  joined.set(pending); joined.set(chunk, pending.length);
+  pending = joined;
+
+  const inFrame = Math.round(ctx.sampleRate * 0.02); // one 20 ms frame at mic rate
+  while (pending.length >= inFrame) {
+    sendFrame(pending.subarray(0, inFrame), inFrame);
+    pending = pending.slice(inFrame);
+  }
+}
+
+function sendFrame(seg, inFrame) {
+  const ratio = inFrame / FRAME_8K;
+  const win = Math.max(1, Math.floor(ratio));
+  const bytes = new Uint8Array(FRAME_8K);
+  let energy = 0;
+  for (let i = 0; i < FRAME_8K; i++) {
+    // window average then decimate: crude low-pass, fine for telephone audio
+    const start = Math.floor(i * ratio);
+    let acc = 0;
+    for (let j = 0; j < win; j++) acc += seg[Math.min(start + j, seg.length - 1)];
+    let s = Math.max(-1, Math.min(1, acc / win));
+    const int16 = Math.round(s * 32767);
+    energy += int16 * int16;
+    bytes[i] = mulawEncodeSample(int16);
+  }
+  updateMeter(Math.sqrt(energy / FRAME_8K));
+  if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({
+      event: "media",
+      streamSid,
+      media: { payload: btoa(String.fromCharCode(...bytes)) },
+    }));
+  }
+}
+
+let meterDecay = 0;
+function updateMeter(rms) {
+  meterDecay = Math.max(rms, meterDecay * 0.9);
+  $("meter").style.width = Math.min(100, meterDecay / METER_MAX * 100) + "%";
+  $("rmsval").textContent = Math.round(meterDecay);
+}
+
+// --- Agent audio playback --------------------------------------------------
+function playMulaw(bytes) {
+  const f32 = new Float32Array(bytes.length);
+  for (let i = 0; i < bytes.length; i++) f32[i] = mulawDecodeSample(bytes[i]) / 32768;
+  const buf = ctx.createBuffer(1, f32.length, 8000);
+  buf.getChannelData(0).set(f32);
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(ctx.destination);
+  const at = Math.max(ctx.currentTime + 0.05, playhead);
+  src.start(at);
+  playhead = at + buf.duration;
+  sources.push(src);
+  src.onended = () => { sources = sources.filter((s) => s !== src); };
+}
+
+// Twilio echoes a mark once the audio queued before it has played out.
+function scheduleMarkEcho(name) {
+  const delayMs = Math.max(0, playhead - ctx.currentTime) * 1000 + 60;
+  const timer = setTimeout(() => {
+    pendingMarks = pendingMarks.filter((m) => m.timer !== timer);
+    sendJson({ event: "mark", streamSid, mark: { name } });
+    log("agent finished speaking");
+  }, delayMs);
+  pendingMarks.push({ name, timer });
+}
+
+// Twilio's clear: flush buffered audio, immediately echo any pending marks.
+function clearPlayback() {
+  for (const s of sources) { try { s.stop(); } catch {} }
+  sources = [];
+  playhead = ctx.currentTime;
+  for (const m of pendingMarks) {
+    clearTimeout(m.timer);
+    sendJson({ event: "mark", streamSid, mark: { name: m.name } });
+  }
+  pendingMarks = [];
+  log("clear received (barge-in), playback flushed");
+}
+
+function sendJson(obj) {
+  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+// --- Call lifecycle --------------------------------------------------------
+const randHex = (n) =>
+  Array.from(crypto.getRandomValues(new Uint8Array(n)), (b) => b.toString(16).padStart(2, "0")).join("");
+
+async function startCall() {
+  $("callBtn").disabled = true;
+  try {
+    ctx = new AudioContext();
+    await ctx.resume();
+    micStream = await navigator.mediaDevices.getUserMedia({
+      // Auto gain is deliberately off: it winds the mic up during pauses,
+      // lifting room noise to speech level and making energy detection useless.
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false },
+    });
+
+    const workletCode = `
+      class Capture extends AudioWorkletProcessor {
+        process(inputs) {
+          const ch = inputs[0] && inputs[0][0];
+          if (ch) this.port.postMessage(ch.slice(0));
+          return true;
+        }
+      }
+      registerProcessor("capture", Capture);`;
+    await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([workletCode], { type: "application/javascript" })));
+    const src = ctx.createMediaStreamSource(micStream);
+    workletNode = new AudioWorkletNode(ctx, "capture");
+    src.connect(workletNode); // deliberately not connected to destination
+    workletNode.port.onmessage = (e) => { if (running) onMicChunk(e.data); };
+
+    callSid = "SIM" + randHex(16);
+    streamSid = "MZ" + randHex(16);
+    playhead = 0;
+    pending = new Float32Array(0);
+
+    ws = new WebSocket(wsUrl);
+    ws.onopen = () => {
+      sendJson({ event: "connected", protocol: "Call", version: "1.0.0" });
+      sendJson({
+        event: "start",
+        sequenceNumber: "1",
+        streamSid,
+        start: {
+          accountSid: "ACsimulator",
+          streamSid,
+          callSid,
+          tracks: ["inbound"],
+          mediaFormat: { encoding: "audio/x-mulaw", sampleRate: 8000, channels: 1 },
+          customParameters: { caller: "browser-simulator" },
+        },
+      });
+      running = true;
+      setStatus("in call");
+      $("callsid").textContent = callSid;
+      $("monitorcmd").textContent = callSid;
+      $("callBtn").textContent = "Hang up";
+      $("callBtn").classList.add("live");
+      $("callBtn").disabled = false;
+      log("call started as " + callSid);
+    };
+    ws.onmessage = (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+      if (msg.event === "media") {
+        const bin = atob(msg.media.payload);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        playMulaw(bytes);
+      } else if (msg.event === "mark") {
+        scheduleMarkEcho(msg.mark.name);
+      } else if (msg.event === "clear") {
+        clearPlayback();
+      }
+    };
+    ws.onclose = () => { if (running) endCall("server closed the stream"); };
+    ws.onerror = () => log("websocket error, is the server running?");
+  } catch (err) {
+    log("failed to start: " + err.message);
+    setStatus("idle");
+    $("callBtn").disabled = false;
+    cleanupAudio();
+  }
+}
+
+function endCall(reason) {
+  running = false;
+  sendJson({ event: "stop", streamSid, stop: { accountSid: "ACsimulator", callSid } });
+  try { ws?.close(); } catch {}
+  ws = null;
+  cleanupAudio();
+  setStatus("idle");
+  $("callBtn").textContent = "Start call";
+  $("callBtn").classList.remove("live");
+  $("callBtn").disabled = false;
+  log("call ended: " + reason);
+}
+
+function cleanupAudio() {
+  for (const m of pendingMarks) clearTimeout(m.timer);
+  pendingMarks = [];
+  sources = [];
+  micStream?.getTracks().forEach((t) => t.stop());
+  micStream = null;
+  workletNode?.disconnect();
+  workletNode = null;
+  ctx?.close();
+  ctx = null;
+  $("meter").style.width = "0";
+  $("rmsval").textContent = "0";
+}
+
+$("callBtn").addEventListener("click", () => (running ? endCall("hang up") : startCall()));
+</script>
+</body>
+</html>

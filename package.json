@@ -1,0 +1,91 @@
+{
+  "name": "@nolag/voice-engine",
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "description": "Real-time voice agent engine: turn taking, barge-in, voice activity detection and call screening, independent of any telephony or AI vendor. Pairs with @nolag/voice for live supervision.",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.mjs"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.cjs"
+      },
+      "default": "./dist/index.mjs"
+    },
+    "./recorder": {
+      "import": {
+        "types": "./dist/recorder.d.ts",
+        "default": "./dist/recorder.mjs"
+      },
+      "require": {
+        "types": "./dist/recorder.d.ts",
+        "default": "./dist/recorder.cjs"
+      },
+      "default": "./dist/recorder.mjs"
+    },
+    "./simulator": {
+      "import": {
+        "types": "./dist/simulator.d.ts",
+        "default": "./dist/simulator.mjs"
+      },
+      "require": {
+        "types": "./dist/simulator.d.ts",
+        "default": "./dist/simulator.cjs"
+      },
+      "default": "./dist/simulator.mjs"
+    },
+    "./simulator.html": "./public/simulator.html",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "public"
+  ],
+  "scripts": {
+    "build": "rollup -c",
+    "dev": "rollup -c -w",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NoLagApp/voice-engine.git"
+  },
+  "author": "NoLag",
+  "license": "MIT",
+  "homepage": "https://nolag.app",
+  "peerDependencies": {
+    "ws": "^8.0.0"
+  },
+  "peerDependenciesMeta": {
+    "ws": {
+      "optional": true
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "bugs": {
+    "url": "https://github.com/NoLagApp/voice-engine/issues"
+  },
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^28.0.1",
+    "@rollup/plugin-node-resolve": "^15.3.0",
+    "@rollup/plugin-typescript": "^12.1.1",
+    "@types/node": "^20.0.0",
+    "rollup": "^4.28.0",
+    "tslib": "^2.8.1",
+    "typescript": "^5.0.0",
+    "vitest": "^2.1.0"
+  }
+}
