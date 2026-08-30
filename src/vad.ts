@@ -42,6 +42,13 @@ export interface UtteranceDetectorOptions {
 export interface DetectorResult {
   /** An utterance opened on this frame. */
   speechStarted?: boolean;
+  /**
+   * An utterance closed on this frame, whether or not it was long enough to
+   * keep. Reported separately from `utterance` because a blip closes without
+   * producing one, and anything tracking who holds the channel would otherwise
+   * believe the caller is still talking for the rest of the call.
+   */
+  speechEnded?: boolean;
   /** The caller is talking over the agent and it should stop. */
   bargeIn?: boolean;
   /** A complete utterance, ready to transcribe. */
@@ -198,7 +205,7 @@ export class UtteranceDetector {
     const speechMs = this.utteranceMs - this.silenceMs;
     const threshold = this.threshold;
     this.reset();
-    if (speechMs < this.minUtteranceMs) return {};
-    return { utterance, level: rms(utterance), threshold };
+    if (speechMs < this.minUtteranceMs) return { speechEnded: true };
+    return { utterance, level: rms(utterance), threshold, speechEnded: true };
   }
 }

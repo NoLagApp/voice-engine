@@ -111,7 +111,8 @@ export class VoiceSession {
   private queue: Promise<unknown> = Promise.resolve();
   private abort: AbortController | null = null;
 
-  private speaking = false;
+  private agentSpeaking = false;
+  private callerSpeaking = false;
   private markCounter = 0;
   private pendingMarks = 0;
   private epoch = 0;
@@ -136,6 +137,25 @@ export class VoiceSession {
 
   private get lines(): ScriptedLines {
     return this.options.lines ?? {};
+  }
+
+  /** True while audio the agent generated is still playing out. */
+  get speaking(): boolean {
+    return this.agentSpeaking;
+  }
+
+  /** True from the moment the caller starts an utterance until it closes. */
+  get listening(): boolean {
+    return this.callerSpeaking;
+  }
+
+  /**
+   * True when neither side holds the channel, so something can be said without
+   * talking over anyone. There is one audio buffer to the far end, so anything
+   * spoken while it is busy is spliced into whatever is already playing.
+   */
+  get floorIsFree(): boolean {
+    return !this.closed && !this.agentSpeaking && !this.callerSpeaking;
   }
 
   private onStart(info: CallInfo): void {
@@ -170,6 +190,12 @@ export class VoiceSession {
   private onAudio(frame: Int16Array): void {
     this.observer.onCallerAudio?.(frame);
     const result = this.detector.push(frame);
+
+    // Who currently holds the channel. A barge-in opens an utterance too, so it
+    // counts as the caller starting to speak even though no `speechStarted`
+    // transition is reported for it.
+    if (result.speechStarted || result.bargeIn) this.callerSpeaking = true;
+    if (result.speechEnded) this.callerSpeaking = false;
 
     if (result.bargeIn) this.bargeIn();
 
@@ -425,7 +451,7 @@ export class VoiceSession {
 
   /** Keeps the detector's interrupt threshold in step with playback. */
   private setSpeaking(speaking: boolean): void {
-    this.speaking = speaking;
+    this.agentSpeaking = speaking;
     this.detector.setAgentSpeaking(speaking);
   }
 
@@ -446,7 +472,7 @@ export class VoiceSession {
     if (!bank || this.fillerTimer) return;
     this.fillerTimer = setTimeout(() => {
       this.fillerTimer = null;
-      if (this.closed || this.speaking) return;
+      if (this.closed || this.agentSpeaking) return;
       const clip = bank.pick();
       if (!clip) return;
       this.observer.onAgentSpeech?.(clip.phrase, { kind: "filler" });

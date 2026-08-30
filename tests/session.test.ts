@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { harness, LOUD } from "./support/harness.js";
+import { harness, LOUD, QUIET } from "./support/harness.js";
 import { FakeFillerBank } from "./support/fake-fillers.js";
 import { flush } from "./support/async.js";
 
@@ -397,6 +397,94 @@ describe("VoiceSession", () => {
 
       await h.providers.tts.drain();
       await h.settle();
+    });
+  });
+
+  describe("who holds the channel", () => {
+    it("is free on a call where nobody has said anything", () => {
+      const h = harness();
+      expect(h.session.floorIsFree).toBe(true);
+    });
+
+    it("follows the caller from their first word to their pause", async () => {
+      const h = harness();
+      h.providers.stt.script = ["Are you open today?"];
+
+      h.calibrate();
+      expect(h.session.listening).toBe(false);
+
+      h.feed(25, LOUD);
+      expect(h.session.listening).toBe(true);
+      expect(h.session.floorIsFree).toBe(false);
+
+      h.feed(40, QUIET);
+      expect(h.session.listening).toBe(false);
+
+      await h.settle();
+    });
+
+    it("releases the channel after a blip too short to be a turn", async () => {
+      const h = harness();
+
+      h.calibrate();
+      // Long enough to open an utterance, too short to survive the minimum.
+      h.feed(5, LOUD);
+      expect(h.session.listening).toBe(true);
+
+      h.feed(40, QUIET);
+
+      // Nothing was transcribed, so a blip is the one case where the only
+      // signal that the caller stopped is the utterance closing empty.
+      expect(h.providers.stt.requests).toHaveLength(0);
+      expect(h.session.listening).toBe(false);
+      expect(h.session.floorIsFree).toBe(true);
+
+      await h.settle();
+    });
+
+    it("treats an interruption as the caller taking the channel", async () => {
+      const h = harness({ lines: { greeting: "Hello there, this is the clinic." } });
+      h.providers.tts.manual = true;
+
+      h.transport.start();
+      await flush();
+      h.calibrate();
+      await h.providers.tts.step();
+
+      expect(h.session.speaking).toBe(true);
+      expect(h.session.floorIsFree).toBe(false);
+
+      h.feed(8, LOUD);
+
+      // No `speechStarted` is reported for an interruption, but the caller is
+      // unmistakably talking.
+      expect(h.observed.bargeIns).toBe(1);
+      expect(h.session.listening).toBe(true);
+
+      h.feed(40, QUIET);
+      expect(h.session.listening).toBe(false);
+
+      await h.providers.tts.drain();
+      await h.settle();
+    });
+
+    it("is free again once playback has finished", async () => {
+      const h = harness({ lines: { greeting: "Hello there." } });
+
+      h.transport.start();
+      await flush();
+      expect(h.session.speaking).toBe(true);
+      expect(h.session.floorIsFree).toBe(false);
+
+      await h.settle();
+      expect(h.session.speaking).toBe(false);
+      expect(h.session.floorIsFree).toBe(true);
+    });
+
+    it("is never free on a call that has ended", async () => {
+      const h = harness();
+      h.session.close("done");
+      expect(h.session.floorIsFree).toBe(false);
     });
   });
 
