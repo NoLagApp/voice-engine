@@ -151,7 +151,20 @@ export class VoiceSession {
     }
     this.history.push({ role: "assistant", content: greeting });
     this.observer.onAgentSpeech?.(greeting, { kind: "greeting" });
-    this.enqueue(() => this.speak(greeting));
+    this.enqueue(() => this.speak(greeting, this.beginTurn()));
+  }
+
+  /**
+   * Starts a cancellable unit of work. Anything that speaks needs one of
+   * these, because synthesis keeps producing audio long after the caller has
+   * interrupted: without a signal to abort, the cleared buffer immediately
+   * refills and the agent talks over the person who just cut in.
+   *
+   * The queue serialises jobs, so one slot is enough.
+   */
+  private beginTurn(): AbortSignal {
+    this.abort = new AbortController();
+    return this.abort.signal;
   }
 
   private onAudio(frame: Int16Array): void {
@@ -180,8 +193,7 @@ export class VoiceSession {
     threshold: number
   ): Promise<void> {
     if (this.closed) return;
-    this.abort = new AbortController();
-    const { signal } = this.abort;
+    const signal = this.beginTurn();
     const startedAt = Date.now();
 
     const text = await this.providers.stt.transcribe({
@@ -280,7 +292,12 @@ export class VoiceSession {
       },
     });
     const llmMs = Date.now() - llmStartedAt;
-    if (!reply) return;
+    if (!reply) {
+      // Nothing to say, so nothing left to cover. A filler left armed here
+      // fires into the silence after the exchange it belonged to is over.
+      this.clearFiller();
+      return;
+    }
     if (remainder.length) queueSpeak(remainder.join(" "));
 
     const spoken = stripMarkdown(reply);
@@ -453,7 +470,7 @@ export class VoiceSession {
   say(text: string): void {
     this.history.push({ role: "assistant", content: text });
     this.observer.onAgentSpeech?.(text, { kind: "injected" });
-    this.enqueue(() => this.speak(text));
+    this.enqueue(() => this.speak(text, this.beginTurn()));
   }
 
   /** Adds guidance the model will see from the next turn on, silently. */
