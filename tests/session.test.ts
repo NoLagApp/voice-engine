@@ -400,6 +400,241 @@ describe("VoiceSession", () => {
     });
   });
 
+  describe("speaking unprompted", () => {
+    it("says it straight away when nothing else is happening", async () => {
+      const h = harness();
+
+      const handle = h.session.speakUnprompted("The 1:15 slot is free.");
+      await h.settle();
+
+      expect(h.providers.tts.spoken).toEqual(["The 1:15 slot is free."]);
+      expect(await handle.done).toBe("spoken");
+      expect(h.observed.agentSpeech).toEqual([
+        { text: "The 1:15 slot is free.", kind: "unprompted" },
+      ]);
+    });
+
+    it("waits for the caller to stop, and answers their question first", async () => {
+      const h = harness();
+      h.providers.stt.script = ["Can you check the one fifteen?"];
+      h.providers.llm.script = ["Let me see."];
+
+      h.calibrate();
+      h.feed(25, LOUD); // mid-sentence, no pause yet
+      expect(h.session.listening).toBe(true);
+
+      const handle = h.session.speakUnprompted("The 1:15 slot is free.");
+      await flush();
+
+      // There is one buffer to the far end. Anything sent now is spliced into
+      // the stream on top of someone who is still talking.
+      expect(h.providers.tts.spoken).toEqual([]);
+      expect(handle.started).toBe(false);
+
+      h.feed(40, QUIET);
+      await h.settle();
+
+      expect(h.providers.tts.spoken).toEqual(["Let me see.", "The 1:15 slot is free."]);
+      expect(await handle.done).toBe("spoken");
+    });
+
+    it("waits for the agent to finish its current line", async () => {
+      const h = harness({ lines: { greeting: "Hello, thanks for calling." } });
+      h.providers.tts.manual = true;
+
+      h.transport.start();
+      await flush();
+      await h.providers.tts.step();
+      expect(h.session.speaking).toBe(true);
+
+      const handle = h.session.speakUnprompted("By the way, we close at six.");
+      await flush();
+      expect(h.providers.tts.spoken).toEqual(["Hello, thanks for calling."]);
+
+      h.providers.tts.manual = false;
+      await h.providers.tts.drain();
+      await h.settle();
+
+      expect(h.providers.tts.spoken).toEqual([
+        "Hello, thanks for calling.",
+        "By the way, we close at six.",
+      ]);
+      expect(await handle.done).toBe("spoken");
+    });
+
+    it("survives the caller interrupting the turn it was waiting behind", async () => {
+      const h = harness({ lines: { greeting: "Hello there, thanks for calling us today." } });
+      h.providers.tts.manual = true;
+      h.providers.stt.script = ["Sorry, go on."];
+      h.providers.llm.script = ["Of course."];
+
+      h.transport.start();
+      await flush();
+      h.calibrate();
+      await h.providers.tts.step();
+
+      const handle = h.session.speakUnprompted("The 1:15 slot is free.");
+
+      h.feed(25, LOUD);
+      expect(h.observed.bargeIns).toBe(1);
+
+      h.providers.tts.manual = false;
+      await h.providers.tts.drain();
+      h.feed(40, QUIET);
+      await h.settle();
+
+      // Cleared audio is stale. The reason for saying something is not: they
+      // asked, they cut in, and the answer still arrives afterwards.
+      expect(await handle.done).toBe("spoken");
+      expect(h.providers.tts.spoken).toContain("The 1:15 slot is free.");
+    });
+
+    it("reports being talked over while it was speaking", async () => {
+      const h = harness();
+      h.providers.tts.manual = true;
+
+      h.calibrate();
+      const handle = h.session.speakUnprompted("This one is long enough to be cut off.");
+      await flush();
+      await h.providers.tts.step();
+      expect(h.session.speaking).toBe(true);
+
+      h.feed(8, LOUD);
+
+      h.providers.tts.manual = false;
+      await h.providers.tts.drain();
+
+      expect(await handle.done).toBe("interrupted");
+      expect(h.observed.errors).toEqual([]);
+    });
+
+    it("can be withdrawn before it is spoken", async () => {
+      const h = harness();
+
+      h.calibrate();
+      h.feed(25, LOUD);
+      const handle = h.session.speakUnprompted("Never mind.");
+
+      expect(handle.cancel()).toBe(true);
+      expect(await handle.done).toBe("cancelled");
+
+      h.feed(40, QUIET);
+      await h.settle();
+      expect(h.providers.tts.spoken).toEqual([]);
+    });
+
+    it("cannot be withdrawn once it has started", async () => {
+      const h = harness();
+      h.providers.tts.manual = true;
+
+      const handle = h.session.speakUnprompted("Already on its way out.");
+      await flush();
+      expect(handle.started).toBe(true);
+      expect(handle.cancel()).toBe(false);
+
+      h.providers.tts.manual = false;
+      await h.providers.tts.drain();
+      await h.settle();
+      expect(await handle.done).toBe("spoken");
+    });
+
+    it("drops a line whose moment has passed", async () => {
+      const h = harness();
+
+      h.calibrate();
+      h.feed(25, LOUD); // the caller keeps talking
+      const handle = h.session.speakUnprompted({ text: "Too late now.", expiresInMs: 20 });
+
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      expect(await handle.done).toBe("expired");
+
+      h.feed(40, QUIET);
+      await h.settle();
+      expect(h.providers.tts.spoken).toEqual([]);
+    });
+
+    it("drops the oldest when lines pile up behind a talking caller", async () => {
+      const h = harness({ maxDeferred: 2 });
+
+      h.calibrate();
+      h.feed(25, LOUD);
+      const first = h.session.speakUnprompted("First.");
+      h.session.speakUnprompted("Second.");
+      h.session.speakUnprompted("Third.");
+
+      // A backlog is a queue of increasingly stale remarks, and the caller
+      // should not be buried under all of them the moment they pause.
+      expect(await first.done).toBe("superseded");
+
+      h.feed(40, QUIET);
+      await h.settle();
+      expect(h.providers.tts.spoken).toEqual(["Second.", "Third."]);
+    });
+
+    it("can be kept out of the conversation the model sees", async () => {
+      const h = harness();
+      h.providers.stt.script = ["Hi there."];
+      h.providers.llm.script = ["Hello."];
+
+      h.session.speakUnprompted({ text: "Reading you a disclosure.", remember: false });
+      await h.settle();
+      expect(h.providers.tts.spoken).toEqual(["Reading you a disclosure."]);
+
+      h.calibrate();
+      h.utterance();
+      await h.settle();
+
+      expect(h.providers.llm.lastMessages.map((m) => m.content)).not.toContain(
+        "Reading you a disclosure."
+      );
+    });
+
+    it("settles everything still waiting when the call ends", async () => {
+      const h = harness();
+
+      h.calibrate();
+      h.feed(25, LOUD);
+      const handle = h.session.speakUnprompted("Never got said.");
+
+      h.session.close("the other end hung up");
+
+      // An unsettled promise here is a leak for the lifetime of the process,
+      // because whatever is waiting on it holds the call's whole context.
+      expect(await handle.done).toBe("closed");
+    });
+
+    it("refuses a line on a call that has already ended", async () => {
+      const h = harness();
+      h.session.close("done");
+
+      const handle = h.session.speakUnprompted("Anyone there?");
+      await h.settle();
+
+      expect(await handle.done).toBe("closed");
+      expect(h.providers.tts.spoken).toEqual([]);
+    });
+
+    it("cuts in when told to, without pretending the caller interrupted", async () => {
+      const h = harness({ lines: { greeting: "Hello there, thanks for calling us today." } });
+      h.providers.tts.manual = true;
+
+      h.transport.start();
+      await flush();
+      await h.providers.tts.step();
+
+      const handle = h.session.say("Sorry, I have to stop you there.", { interrupt: true });
+
+      h.providers.tts.manual = false;
+      await h.providers.tts.drain();
+      await h.settle();
+
+      expect(h.transport.clears).toBe(1);
+      expect(h.observed.bargeIns).toBe(0);
+      expect(await handle.done).toBe("spoken");
+      expect(h.providers.tts.spoken).toContain("Sorry, I have to stop you there.");
+    });
+  });
+
   describe("who holds the channel", () => {
     it("is free on a call where nobody has said anything", () => {
       const h = harness();

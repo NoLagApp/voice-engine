@@ -49,6 +49,9 @@ export type {
   ScriptedLines,
   SessionObserver,
   TurnMetrics,
+  UnpromptedSpeech,
+  UnpromptedHandle,
+  UnpromptedOutcome,
 } from "./session.js";
 
 export { createFillerBank, DEFAULT_FILLERS } from "./fillers.js";

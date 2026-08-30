@@ -73,6 +73,67 @@ export interface VoiceSessionOptions {
   waitForHello?: boolean;
   /** Optional observer, used for coordination and recording. */
   observer?: SessionObserver;
+  /**
+   * How many unprompted lines may wait for the floor at once. Beyond this the
+   * oldest is dropped: a backlog of things to say is a queue of increasingly
+   * stale remarks, and a caller who pauses should not be buried under all of
+   * them at once.
+   */
+  maxDeferred?: number;
+}
+
+/** Something to say that no caller turn asked for. */
+export interface UnpromptedSpeech {
+  text: string;
+  /** Reported to the observer as the kind of speech this is. */
+  kind?: string;
+  /** Add to the conversation the model sees. Defaults to true. */
+  remember?: boolean;
+  /**
+   * Drop it unspoken if the floor has not freed by then. Worth setting for
+   * anything whose relevance decays, which is most things: talking over
+   * someone is worse than staying quiet, and the next ordinary turn can
+   * usually still carry the point.
+   */
+  expiresInMs?: number;
+  /**
+   * Cut in rather than wait. For a supervisor stopping a call going wrong, not
+   * for an answer arriving late, which should never talk over anyone.
+   */
+  interrupt?: boolean;
+}
+
+export type UnpromptedOutcome =
+  /** Said in full. */
+  | "spoken"
+  /** Started, then the caller talked over it. */
+  | "interrupted"
+  /** Withdrawn before it was said. */
+  | "cancelled"
+  /** The floor never freed in time. */
+  | "expired"
+  /** Pushed out of the queue by newer lines. */
+  | "superseded"
+  /** The call ended first. */
+  | "closed";
+
+export interface UnpromptedHandle {
+  /** Settles exactly once, and never rejects. */
+  readonly done: Promise<UnpromptedOutcome>;
+  /** True once the line has begun being spoken. */
+  readonly started: boolean;
+  /** Withdraw it. False if it is already being spoken. */
+  cancel(): boolean;
+}
+
+interface DeferredLine {
+  text: string;
+  kind: string;
+  remember: boolean;
+  started: boolean;
+  settled: boolean;
+  timer: ReturnType<typeof setTimeout> | null;
+  settle(outcome: UnpromptedOutcome): void;
 }
 
 export interface TurnMetrics {
@@ -121,6 +182,8 @@ export class VoiceSession {
   private screenTurns = 0;
   private hangUpWhenDone = false;
   private closed = false;
+  private deferred: DeferredLine[] = [];
+  private inflight = 0;
 
   constructor(options: VoiceSessionOptions) {
     this.options = options;
@@ -195,7 +258,13 @@ export class VoiceSession {
     // counts as the caller starting to speak even though no `speechStarted`
     // transition is reported for it.
     if (result.speechStarted || result.bargeIn) this.callerSpeaking = true;
-    if (result.speechEnded) this.callerSpeaking = false;
+    if (result.speechEnded) {
+      this.callerSpeaking = false;
+      // Deferred behind the reply to whatever they just said, rather than in
+      // front of it: the utterance is enqueued further down this same handler,
+      // and answering the question they just asked comes first.
+      queueMicrotask(() => this.pump());
+    }
 
     if (result.bargeIn) this.bargeIn();
 
@@ -207,10 +276,19 @@ export class VoiceSession {
 
   /** Utterances are processed one at a time, in order. */
   private enqueue(job: () => Promise<unknown>): void {
-    this.queue = this.queue.then(job).catch((error: Error) => {
-      if (error?.name === "AbortError") return; // barge-in cancelled it, expected
-      this.observer.onError?.(error);
-    });
+    this.inflight += 1;
+    this.queue = this.queue
+      .then(job)
+      .catch((error: Error) => {
+        if (error?.name === "AbortError") return; // barge-in cancelled it, expected
+        this.observer.onError?.(error);
+      })
+      .then(() => {
+        this.inflight -= 1;
+        // The queue going idle is one of the moments something waiting for the
+        // floor might now be able to speak.
+        if (this.inflight === 0) this.pump();
+      });
   }
 
   private async handleUtterance(
@@ -446,7 +524,9 @@ export class VoiceSession {
     if (this.hangUpWhenDone) {
       this.close("message left");
       this.transport.close();
+      return;
     }
+    this.pump();
   }
 
   /** Keeps the detector's interrupt threshold in step with playback. */
@@ -455,7 +535,8 @@ export class VoiceSession {
     this.detector.setAgentSpeaking(speaking);
   }
 
-  private bargeIn(): void {
+  /** Stops the agent mid-sentence and gives up the channel. */
+  private stopSpeaking(): void {
     this.abort?.abort();
     this.clearFiller();
     this.transport.clear();
@@ -464,6 +545,10 @@ export class VoiceSession {
     this.epoch += 1;
     this.pendingMarks = 0;
     this.setSpeaking(false);
+  }
+
+  private bargeIn(): void {
+    this.stopSpeaking();
     this.observer.onBargeIn?.();
   }
 
@@ -492,11 +577,150 @@ export class VoiceSession {
     }
   }
 
-  /** Injects a line to say now, for a supervisor steering the call. */
-  say(text: string): void {
-    this.history.push({ role: "assistant", content: text });
-    this.observer.onAgentSpeech?.(text, { kind: "injected" });
-    this.enqueue(() => this.speak(text, this.beginTurn()));
+  /**
+   * Says something no caller turn asked for, once there is room to say it.
+   *
+   * This is the primitive behind anything arriving from outside the
+   * conversation: a supervisor steering the call, or an answer that took longer
+   * to find than a turn could wait for. It is not a second audio path. There is
+   * one buffer to the far end, so it goes through the same queue as everything
+   * else and waits for the floor, which is what stops two voices being spliced
+   * into one stream.
+   *
+   * Deliberately not cancelled by a barge-in. Cleared audio is stale, but the
+   * intention behind a line is not: someone asked a question, interrupted the
+   * stalling, and the answer still arrives afterwards. Use `expiresInMs` for
+   * things that genuinely stop being worth saying.
+   */
+  speakUnprompted(speech: string | UnpromptedSpeech): UnpromptedHandle {
+    const request: UnpromptedSpeech = typeof speech === "string" ? { text: speech } : speech;
+
+    let resolve!: (outcome: UnpromptedOutcome) => void;
+    const done = new Promise<UnpromptedOutcome>((res) => {
+      resolve = res;
+    });
+
+    const line: DeferredLine = {
+      text: request.text,
+      kind: request.kind ?? "unprompted",
+      remember: request.remember ?? true,
+      started: false,
+      settled: false,
+      timer: null,
+      settle(outcome) {
+        if (this.settled) return;
+        this.settled = true;
+        if (this.timer) clearTimeout(this.timer);
+        this.timer = null;
+        resolve(outcome);
+      },
+    };
+
+    const handle: UnpromptedHandle = {
+      done,
+      get started() {
+        return line.started;
+      },
+      cancel: () => {
+        if (line.started || line.settled) return false;
+        this.drop(line, "cancelled");
+        return true;
+      },
+    };
+
+    if (this.closed || !request.text.trim()) {
+      line.settle("closed");
+      return handle;
+    }
+
+    if (request.expiresInMs !== undefined) {
+      line.timer = setTimeout(() => {
+        if (line.started) return; // too late to withdraw, let it finish
+        this.drop(line, "expired");
+      }, request.expiresInMs);
+    }
+
+    // Cutting in is a separate path on purpose: it skips the queue of things
+    // politely waiting, because the reason to cut in is that waiting is wrong.
+    if (request.interrupt) {
+      this.stopSpeaking();
+      this.enqueue(() => this.deliver(line));
+      return handle;
+    }
+
+    this.deferred.push(line);
+    const cap = Math.max(1, this.options.maxDeferred ?? 2);
+    while (this.deferred.length > cap) {
+      this.deferred.shift()?.settle("superseded");
+    }
+    this.pump();
+    return handle;
+  }
+
+  /** Removes a line that will never be spoken. */
+  private drop(line: DeferredLine, outcome: UnpromptedOutcome): void {
+    const at = this.deferred.indexOf(line);
+    if (at >= 0) this.deferred.splice(at, 1);
+    line.settle(outcome);
+  }
+
+  /**
+   * Speaks the next waiting line, if this is a moment when it can be said.
+   *
+   * Called from every edge that could free the floor: a new line arriving, the
+   * queue going idle, playback finishing, and the caller stopping. There is no
+   * polling, so a line waits exactly as long as the conversation makes it wait.
+   */
+  private pump(): void {
+    if (this.closed || this.inflight > 0 || !this.deferred.length) return;
+    if (!this.floorIsFree) return;
+
+    this.enqueue(async () => {
+      const line = this.deferred[0];
+      if (!line) return;
+      // The caller can start talking between deciding to speak and getting
+      // here, because audio arrives synchronously from the transport. Leave the
+      // line queued; the next edge will try again.
+      if (this.callerSpeaking || this.closed) return;
+      this.deferred.shift();
+      await this.deliver(line);
+    });
+  }
+
+  private async deliver(line: DeferredLine): Promise<void> {
+    if (this.closed) {
+      line.settle("closed");
+      return;
+    }
+    line.started = true;
+    if (line.remember) {
+      this.history.push({ role: "assistant", content: line.text });
+      this.trimHistory();
+    }
+    this.observer.onAgentSpeech?.(line.text, { kind: line.kind });
+
+    const signal = this.beginTurn();
+    try {
+      await this.speak(line.text, signal);
+      line.settle(signal.aborted ? "interrupted" : "spoken");
+    } catch (error) {
+      line.settle((error as Error)?.name === "AbortError" ? "interrupted" : "spoken");
+      throw error;
+    }
+  }
+
+  /**
+   * Injects a line to say now, for a supervisor steering the call.
+   *
+   * Waits for a gap rather than talking over whoever is speaking. Pass
+   * `interrupt` when stopping the call matters more than being polite.
+   */
+  say(text: string, options: { interrupt?: boolean } = {}): UnpromptedHandle {
+    return this.speakUnprompted({
+      text,
+      kind: "injected",
+      interrupt: options.interrupt,
+    });
   }
 
   /** Adds guidance the model will see from the next turn on, silently. */
@@ -509,6 +733,12 @@ export class VoiceSession {
     this.closed = true;
     this.abort?.abort();
     this.clearFiller();
+    // Anything still waiting for a gap will never get one. Settling rather than
+    // abandoning matters because callers await these: an orchestrator holding a
+    // promise that never resolves leaks for the lifetime of the process.
+    const waiting = this.deferred;
+    this.deferred = [];
+    for (const line of waiting) line.settle("closed");
     this.observer.onCallEnded?.(reason);
   }
 }
