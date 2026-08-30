@@ -635,6 +635,242 @@ describe("VoiceSession", () => {
     });
   });
 
+  describe("stalling through a long wait", () => {
+    it("climbs the rungs while the wait goes on", async () => {
+      const h = harness();
+      const stall = h.session.beginStall({
+        lines: ["Let me have a look.", "The system is a bit slow today.", "Nearly there."],
+        everyMs: 20,
+      });
+
+      // A phone reporting playback as it happens, which is what frees the
+      // channel between rungs.
+      await h.play(300, () => stall.stage >= 3);
+      await h.settle();
+
+      // Escalating, not repeating: the second thing you say to someone who has
+      // been waiting cannot be the first thing again.
+      expect(h.providers.tts.spoken).toEqual([
+        "Let me have a look.",
+        "The system is a bit slow today.",
+        "Nearly there.",
+      ]);
+      expect(stall.stage).toBe(3);
+    });
+
+    it("says nothing at all if the wait ends first", async () => {
+      const h = harness();
+      const stall = h.session.beginStall({ lines: ["Let me have a look."], everyMs: 50 });
+
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      stall.stop();
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      await h.settle();
+
+      expect(h.providers.tts.spoken).toEqual([]);
+      expect(stall.stage).toBe(0);
+    });
+
+    it("withdraws a rung that has not been spoken yet", async () => {
+      const h = harness();
+
+      h.calibrate();
+      h.feed(25, LOUD); // the caller is talking, so no rung can go out
+      const stall = h.session.beginStall({ lines: ["Let me have a look."], everyMs: 10 });
+
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(stall.stage).toBe(1);
+      stall.stop();
+
+      h.feed(40, QUIET);
+      await h.settle();
+      expect(h.providers.tts.spoken).toEqual([]);
+    });
+
+    it("never talks over the caller", async () => {
+      const h = harness();
+      h.providers.stt.script = ["I was still saying something."];
+      h.providers.llm.script = ["Understood."];
+
+      h.calibrate();
+      h.feed(25, LOUD);
+      h.session.beginStall({ lines: ["Let me have a look."], everyMs: 10 });
+
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(h.providers.tts.spoken).toEqual([]);
+
+      h.feed(40, QUIET);
+      await h.settle();
+      // The rung expired while the caller held the channel, so it never lands
+      // after the thing it was covering for.
+      expect(h.providers.tts.spoken).toEqual(["Understood."]);
+    });
+
+    it("keeps its own timing separate from the ordinary filler", async () => {
+      const fillers = new FakeFillerBank();
+      const h = harness({ fillers, fillerDelayMs: 15 });
+      h.providers.stt.script = ["Can you look that up?"];
+      h.providers.llm.script = ["Here it is."];
+      h.providers.llm.manual = true;
+
+      h.calibrate();
+      h.utterance();
+      const stall = h.session.beginStall({
+        lines: ["Still working on it.", "Nearly there."],
+        everyMs: 25,
+      });
+
+      await h.play(400, () => stall.stage >= 2);
+
+      // A filler is single-shot and suppresses itself once the agent speaks. If
+      // the stall shared that state, speaking the filler would cancel the first
+      // rung and speaking the first rung would cancel the second. They share no
+      // state at all, so neither can cancel the other.
+      expect(fillers.picked).toEqual(["let me have a look"]);
+      expect(h.said()).toContain("Still working on it.");
+      expect(h.said()).toContain("Nearly there.");
+
+      // All of that happened while the model was still writing, which is the
+      // point: the work queue is held by the turn for the whole wait.
+      expect(h.providers.llm.waiting).toBe(true);
+
+      await h.providers.llm.drain();
+      await h.settle();
+      expect(h.providers.tts.spoken).toContain("Here it is.");
+    });
+
+    it("stops mid-rung when the caller cuts in, and does not resume", async () => {
+      const h = harness();
+      h.providers.tts.manual = true;
+
+      h.calibrate();
+      const stall = h.session.beginStall({
+        lines: ["Still working on it.", "Nearly there."],
+        everyMs: 20,
+      });
+
+      await h.providers.tts.step();
+      expect(h.session.speaking).toBe(true);
+
+      h.feed(8, LOUD);
+      expect(h.observed.bargeIns).toBe(1);
+
+      h.providers.tts.manual = false;
+      await h.providers.tts.drain();
+      const sentWhenInterrupted = h.transport.sent.length;
+
+      // A stall speaks outside the turn, so it needs its own cancellation.
+      // Being talked to is also the end of needing to fill the silence.
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      await h.settle();
+
+      expect(h.transport.sent).toHaveLength(sentWhenInterrupted);
+      expect(stall.stage).toBe(1);
+      expect(h.said()).toEqual(["Still working on it."]);
+    });
+
+    it("never splices its audio into a clip that is already going out", async () => {
+      const h = harness();
+      h.providers.tts.manual = true;
+      h.providers.stt.script = ["Can you look that up?"];
+      h.providers.llm.script = ["Here is the answer."];
+
+      h.calibrate();
+      h.utterance();
+      await flush();
+
+      // Synthesis of the reply has started but no audio has gone out, so
+      // nothing is audible yet and the channel still reads as free. This is the
+      // window where two speakers can both believe it is their turn.
+      expect(h.providers.tts.waiting).toBe(true);
+      expect(h.session.speaking).toBe(false);
+
+      h.session.beginStall({ lines: ["Still working on it."], everyMs: 5 });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+
+      // Released chunk by chunk, so anything that is genuinely in flight at the
+      // same time gets the chance to interleave rather than being serialised by
+      // the test itself.
+      await h.providers.tts.drain();
+
+      // There is one buffer to the far end. Two clips streaming at once are
+      // heard as alternating fragments of two sentences, so each clip's audio
+      // has to go out in one unbroken run.
+      expect(h.providers.tts.clipOrder).toEqual(h.providers.tts.spoken);
+      expect(h.providers.tts.spoken).toHaveLength(2);
+    });
+
+    it("stops stalling when the call ends", async () => {
+      const h = harness();
+      const stall = h.session.beginStall({ lines: ["One.", "Two."], everyMs: 20 });
+
+      h.session.close("done");
+      await new Promise((resolve) => setTimeout(resolve, 80));
+
+      expect(h.providers.tts.spoken).toEqual([]);
+      expect(stall.stage).toBe(0);
+    });
+  });
+
+  describe("policy that can be replaced", () => {
+    it("ends the call on a farewell the defaults do not know", async () => {
+      const h = harness({
+        lines: { farewell: "Tot siens." },
+        policy: { isFarewell: (text) => /\bnou lekker\b/i.test(text) },
+      });
+      h.providers.stt.script = ["Nou lekker."];
+
+      h.calibrate();
+      h.utterance();
+      await h.settle();
+
+      expect(h.providers.tts.spoken).toEqual(["Tot siens."]);
+      expect(h.transport.closed).toBe(true);
+    });
+
+    it("lets the model handle a screener when screening is turned off", async () => {
+      const h = harness({
+        lines: { identify: "It's the clinic." },
+        policy: { classifyScreening: () => null },
+      });
+      h.providers.stt.script = ["Who's calling please?"];
+      h.providers.llm.script = ["It's the clinic, about your appointment."];
+
+      h.calibrate();
+      h.utterance();
+      await h.settle();
+
+      expect(h.observed.screenings).toEqual([]);
+      expect(h.providers.tts.spoken).toEqual(["It's the clinic, about your appointment."]);
+    });
+
+    it("keeps a transcript the default rules would have thrown away", async () => {
+      const h = harness({ policy: { isLikelyNoise: () => false } });
+      h.providers.stt.script = ["you"];
+      h.providers.llm.script = ["Sorry, could you say that again?"];
+
+      h.calibrate();
+      h.utterance(800);
+      await h.settle();
+
+      expect(h.observed.callerSpeech).toEqual(["you"]);
+    });
+
+    it("applies a replacement cleaner to everything spoken", async () => {
+      const h = harness({
+        policy: { stripMarkdown: (text) => text.replace(/\bBRAND\b/g, "the clinic") },
+      });
+      h.providers.stt.script = ["Who is this?"];
+      h.providers.llm.script = ["This is BRAND calling."];
+
+      h.calibrate();
+      h.utterance();
+      await h.settle();
+
+      expect(h.providers.tts.spoken).toEqual(["This is the clinic calling."]);
+    });
+  });
+
   describe("who holds the channel", () => {
     it("is free on a call where nobody has said anything", () => {
       const h = harness();

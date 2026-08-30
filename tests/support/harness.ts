@@ -52,6 +52,12 @@ export interface Harness {
   utterance(amplitude?: number): void;
   /** Drain the work queue and let all outstanding playback report back. */
   settle(): Promise<void>;
+  /**
+   * Keep reporting playback as it happens, the way a live call does, until a
+   * condition holds or the time runs out. Needed wherever a behaviour depends
+   * on the channel freeing up between one thing being said and the next.
+   */
+  play(withinMs: number, until: () => boolean): Promise<void>;
   /** The text of everything the agent said, in order. */
   said(): string[];
 }
@@ -126,6 +132,13 @@ export function harness(
         await transport.finishPlayback();
       }
       await flush();
+    },
+    async play(withinMs: number, until: () => boolean): Promise<void> {
+      const deadline = Date.now() + withinMs;
+      while (!until() && Date.now() < deadline) {
+        await flush(2);
+        await transport.finishPlayback();
+      }
     },
     said: () => observed.agentSpeech.map((entry) => entry.text),
   };

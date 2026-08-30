@@ -80,6 +80,12 @@ export interface VoiceSessionOptions {
    * them at once.
    */
   maxDeferred?: number;
+  /**
+   * Override how a transcript is judged before the model sees it. The defaults
+   * are tuned for English phone calls, which is a specific enough thing to be
+   * wrong for someone.
+   */
+  policy?: SessionPolicy;
 }
 
 /** Something to say that no caller turn asked for. */
@@ -126,6 +132,40 @@ export interface UnpromptedHandle {
   cancel(): boolean;
 }
 
+/**
+ * Keeping the caller company while something slow happens.
+ *
+ * Distinct from a filler, which is one short phrase covering the ordinary gap
+ * before a reply starts. A stall covers a wait long enough that silence starts
+ * to read as a dropped call, and it escalates: the second thing you say to
+ * someone who has been waiting cannot be the first thing again.
+ */
+export interface StallOptions {
+  /** What to say, in order, as the wait goes on. */
+  lines: string[];
+  /** Delay before the first line, and between the rest. */
+  everyMs?: number;
+  /** Add these to the conversation the model sees. Defaults to false. */
+  remember?: boolean;
+  /** Reported to the observer as the kind of speech. Defaults to "stall". */
+  kind?: string;
+}
+
+export interface StallHandle {
+  /** Stop stalling, and withdraw any line that has not been said yet. */
+  stop(): void;
+  /** How many lines have been reached so far. */
+  readonly stage: number;
+}
+
+/** The four judgements made about a transcript before the model sees it. */
+export interface SessionPolicy {
+  isLikelyNoise?(text: string, level: number, threshold: number): boolean;
+  classifyScreening?(text: string): ScreeningKind | null;
+  isFarewell?(text: string): boolean;
+  stripMarkdown?(text: string): string;
+}
+
 interface DeferredLine {
   text: string;
   kind: string;
@@ -166,6 +206,7 @@ export class VoiceSession {
   private readonly options: VoiceSessionOptions;
   private readonly detector: UtteranceDetector;
   private readonly observer: SessionObserver;
+  private readonly policy: Required<SessionPolicy>;
 
   info: CallInfo | null = null;
   private history: ChatMessage[] = [];
@@ -183,6 +224,9 @@ export class VoiceSession {
   private hangUpWhenDone = false;
   private closed = false;
   private deferred: DeferredLine[] = [];
+  private stalls = new Set<StallHandle>();
+  private stallAborts = new Set<AbortController>();
+  private outbound: Promise<unknown> = Promise.resolve();
   private inflight = 0;
 
   constructor(options: VoiceSessionOptions) {
@@ -191,6 +235,12 @@ export class VoiceSession {
     this.providers = options.providers;
     this.observer = options.observer ?? {};
     this.detector = new UtteranceDetector(options.detector);
+    this.policy = {
+      isLikelyNoise: options.policy?.isLikelyNoise ?? isLikelyNoise,
+      classifyScreening: options.policy?.classifyScreening ?? classifyScreening,
+      isFarewell: options.policy?.isFarewell ?? isFarewell,
+      stripMarkdown: options.policy?.stripMarkdown ?? stripMarkdown,
+    };
 
     this.transport.onStart((info) => this.onStart(info));
     this.transport.onAudio((frame) => this.onAudio(frame));
@@ -308,7 +358,7 @@ export class VoiceSession {
     const sttMs = Date.now() - startedAt;
     if (!text) return;
 
-    if (isLikelyNoise(text, level, threshold)) return;
+    if (this.policy.isLikelyNoise(text, level, threshold)) return;
 
     this.observer.onCallerSpeech?.(text, { sttMs });
     this.history.push({ role: "user", content: text });
@@ -317,7 +367,7 @@ export class VoiceSession {
     // A screener or voicemail system is not the customer. Answer it from a
     // script: the model, left to itself, greets it by name and starts
     // confirming private details to whatever machine picked up.
-    const screening = classifyScreening(text);
+    const screening = this.policy.classifyScreening(text);
     if (screening) {
       await this.handleScreening(screening, signal);
       return;
@@ -326,7 +376,7 @@ export class VoiceSession {
 
     // The caller is winding up. Say goodbye and hang up, rather than answering
     // again and leaving them to hang up on an agent that will not stop talking.
-    if (isFarewell(text)) {
+    if (this.policy.isFarewell(text)) {
       await this.speakScripted(this.lines.farewell, signal, { hangUp: true });
       return;
     }
@@ -404,7 +454,7 @@ export class VoiceSession {
     }
     if (remainder.length) queueSpeak(remainder.join(" "));
 
-    const spoken = stripMarkdown(reply);
+    const spoken = this.policy.stripMarkdown(reply);
     this.history.push({ role: "assistant", content: spoken });
     this.observer.onAgentSpeech?.(spoken, { kind: "reply", llmMs });
 
@@ -461,8 +511,31 @@ export class VoiceSession {
    * for the whole clip. Returns ms until the first audio went out.
    */
   async speak(rawText: string, signal?: AbortSignal): Promise<number> {
+    return this.serialiseAudio(() => this.synthesise(rawText, signal));
+  }
+
+  /**
+   * One clip at a time, whoever asked for it.
+   *
+   * Separate from the work queue on purpose. The queue serialises turns, and a
+   * turn waiting on a slow model holds it for the entire wait, which is exactly
+   * when something else needs to be able to speak. Audio is the thing that
+   * genuinely cannot overlap: there is one buffer to the far end, so two clips
+   * streaming at once are spliced into a single stream of alternating
+   * fragments of two sentences.
+   */
+  private serialiseAudio<T>(job: () => Promise<T>): Promise<T> {
+    const run = this.outbound.then(job, job);
+    this.outbound = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  }
+
+  private async synthesise(rawText: string, signal?: AbortSignal): Promise<number> {
     if (this.closed) return 0;
-    const text = stripMarkdown(rawText);
+    const text = this.policy.stripMarkdown(rawText);
     if (!text) return 0;
 
     const startedAt = Date.now();
@@ -538,6 +611,12 @@ export class VoiceSession {
   /** Stops the agent mid-sentence and gives up the channel. */
   private stopSpeaking(): void {
     this.abort?.abort();
+    // A stall speaks outside the turn, so it has its own signal. Without this
+    // the caller interrupts, the turn stops, and the stall keeps going. Being
+    // talked to is also the end of needing to fill the silence, so the ladder
+    // stops rather than merely going quiet.
+    for (const controller of this.stallAborts) controller.abort();
+    for (const stall of [...this.stalls]) stall.stop();
     this.clearFiller();
     this.transport.clear();
     // Discarded audio never plays, so its marks may never come back. Move to a
@@ -657,6 +736,77 @@ export class VoiceSession {
     return handle;
   }
 
+  /**
+   * Keeps the caller company while something slow happens, escalating as the
+   * wait goes on.
+   *
+   * Deliberately not built on the filler timer. A filler is single-shot and
+   * suppresses itself the moment the agent starts speaking, which is right for
+   * covering the gap before a reply but would swallow every rung after the
+   * first here: speaking rung one would cancel rung two. The two mechanisms
+   * share no state at all, so neither can cancel the other by accident.
+   *
+   * Each rung goes out through `speakUnprompted`, so a stall never talks over
+   * the caller, and expires at the next rung's due time: a stall line that
+   * missed its gap is worse than no stall, because it lands after the thing it
+   * was covering for has already been said.
+   */
+  beginStall(options: StallOptions): StallHandle {
+    const lines = options.lines.map((line) => line.trim()).filter(Boolean);
+    const everyMs = Math.max(1, options.everyMs ?? 4000);
+    const controller = new AbortController();
+    let stage = 0;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const stop = (): void => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+      this.stallAborts.delete(controller);
+      this.stalls.delete(handle);
+    };
+
+    const tick = (): void => {
+      timer = null;
+      if (this.closed || stage >= lines.length) {
+        stop();
+        return;
+      }
+      const text = lines[stage];
+      stage += 1;
+
+      // Skipped rather than queued when someone is talking. A rung that waits
+      // for a gap arrives after the thing it was covering for, which is worse
+      // than never having said it.
+      if (this.floorIsFree) {
+        if (options.remember ?? false) {
+          this.history.push({ role: "assistant", content: text });
+          this.trimHistory();
+        }
+        this.observer.onAgentSpeech?.(text, { kind: options.kind ?? "stall" });
+        void this.speak(text, controller.signal).catch((error: Error) => {
+          if (error?.name === "AbortError") return;
+          this.observer.onError?.(error);
+        });
+      }
+
+      if (stage < lines.length) timer = setTimeout(tick, everyMs);
+    };
+
+    const handle: StallHandle = {
+      stop,
+      get stage() {
+        return stage;
+      },
+    };
+
+    if (lines.length) {
+      this.stallAborts.add(controller);
+      timer = setTimeout(tick, everyMs);
+    }
+    this.stalls.add(handle);
+    return handle;
+  }
+
   /** Removes a line that will never be spoken. */
   private drop(line: DeferredLine, outcome: UnpromptedOutcome): void {
     const at = this.deferred.indexOf(line);
@@ -736,6 +886,7 @@ export class VoiceSession {
     // Anything still waiting for a gap will never get one. Settling rather than
     // abandoning matters because callers await these: an orchestrator holding a
     // promise that never resolves leaks for the lifetime of the process.
+    for (const stall of [...this.stalls]) stall.stop();
     const waiting = this.deferred;
     this.deferred = [];
     for (const line of waiting) line.settle("closed");

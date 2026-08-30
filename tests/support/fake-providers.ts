@@ -104,6 +104,12 @@ export class FakeTextToSpeech extends Paced implements TextToSpeech {
   readonly aborted: string[] = [];
   /** Clips that ran to completion without a signal being passed at all. */
   readonly unsignalled: string[] = [];
+  /**
+   * Which clip each chunk of audio belonged to, in the order it went out. Two
+   * clips streaming at once show up here as alternating entries, which is what
+   * the far end would hear as two half-sentences spliced together.
+   */
+  readonly emissions: string[] = [];
 
   async speak(request: SpeakRequest): Promise<void> {
     this.spoken.push(request.text);
@@ -115,8 +121,14 @@ export class FakeTextToSpeech extends Paced implements TextToSpeech {
         this.aborted.push(request.text);
         throw abortError();
       }
+      this.emissions.push(request.text);
       request.onAudio(pcm16(this.samplesPerChunk, 1000 + i));
     }
+  }
+
+  /** Distinct clips, in the order their audio started going out. */
+  get clipOrder(): string[] {
+    return this.emissions.filter((text, at) => at === 0 || this.emissions[at - 1] !== text);
   }
 }
 

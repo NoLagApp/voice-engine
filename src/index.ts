@@ -52,6 +52,9 @@ export type {
   UnpromptedSpeech,
   UnpromptedHandle,
   UnpromptedOutcome,
+  StallOptions,
+  StallHandle,
+  SessionPolicy,
 } from "./session.js";
 
 export { createFillerBank, DEFAULT_FILLERS } from "./fillers.js";
